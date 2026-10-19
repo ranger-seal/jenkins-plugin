@@ -1,0 +1,464 @@
+我重新按这次实际日志梳理了一遍。这次报错不是权限、GitLab、Credentials，也不是 Job 已存在，而是新版 Jenkins 父类与旧 Multi-Branch 插件同时保存了 disabled 状态，导致 Jobcopy Builder 无法执行 “Enable Job”。
+
+一、这次报错发生在哪一步
+
+复制流程已经完成了这些步骤：
+
+1. 找到 Template_BuildCheck
+2. 成功读取 config.xml
+3. 成功取得 GitLab 参数
+4. 准备对模板执行 Enable Job
+
+
+真正失败在：
+
+Enabling Job...Failed to fetch disabled node.
+
+
+也就是还没有进入：
+
+Creating 30_BuildCheck_dwh2_DWH_BATCH
+
+
+因此这次没有创建完整目标 Job。
+
+二、直接原因
+
+当前 Template_BuildCheck/config.xml 中，同时存在两个同级的 disabled 节点。
+
+第一个是新版 Jenkins / Branch API / Folder 父类保存的：
+
+<disabled>false</disabled>
+
+
+第二个是旧版 multi-branch-project-plugin 自己定义的：
+
+<disabled defined-in="com.github.mjdetullio.jenkins.plugins.multibranch.TemplateDrivenMultiBranchProject">true</disabled>
+
+
+完整结构相当于：
+
+<freestyle-multi-branch-project>
+  ...
+  <disabled>false</disabled>
+  ...
+  <disabled defined-in="com.github.mjdetullio.jenkins.plugins.multibranch.TemplateDrivenMultiBranchProject">true</disabled>
+  ...
+</freestyle-multi-branch-project>
+
+
+Jobcopy Builder 的 Enable Job 操作要求找到一个明确、唯一的 disabled 节点，然后执行：
+
+true → false
+
+
+现在出现两个 disabled，而且值还互相矛盾：
+
+父类 disabled = false
+插件 disabled = true
+
+
+所以 Jobcopy Builder 无法确定应该修改哪个，最终报：
+
+Failed to fetch disabled node
+
+三、为什么旧环境没有问题
+
+旧版 Jenkins、旧版 Branch API 或旧版 CloudBees Folder 中，父类可能没有保存当前这种通用 disabled 属性，因此旧插件自己实现了一套：
+
+private boolean disabled;
+
+
+当插件迁移到 Jenkins 2.555.1 后，新版父类本身已经开始持有并保存禁用状态。
+
+于是出现了状态重复：
+
+新版父类的 disabled
++
+旧插件自己的 disabled
+
+
+你之前为插件完成了 Jenkins 2.555.1 的编译兼容，但这个属于运行时配置模型兼容问题，编译本身不会报错。
+
+四、建议采用的唯一正式方案
+修改 multi-branch-project-plugin
+
+不要修改 Jobcopy Builder，也不要在 Util_CopyBuildCheckJob 中使用特殊字符串替换绕过。
+
+正式方案是：
+
+删除 TemplateDrivenMultiBranchProject 自己保存的 disabled 字段，统一使用新版父类提供的禁用状态。
+
+这样最终 XML 中只保留一个：
+
+<disabled>true</disabled>
+
+
+Jobcopy Builder 原来的 Enable Job 操作就可以继续使用。
+
+五、具体修改位置
+
+进入插件源码根目录，先搜索：
+
+grep -RniE "boolean disabled|isDisabled|setDisabled|disabled" src/main/java src/main/resources
+
+
+重点检查：
+
+src/main/java/com/github/mjdetullio/jenkins/plugins/multibranch/TemplateDrivenMultiBranchProject.java
+
+预计会看到的代码
+
+可能类似：
+
+private boolean disabled;
+
+
+以及：
+
+public boolean isDisabled() {
+    return disabled;
+}
+
+public void setDisabled(boolean disabled) {
+    this.disabled = disabled;
+}
+
+
+也可能存在：
+
+if (disabled) {
+    ...
+}
+
+六、源码修改方法
+1. 删除插件自己的字段
+
+删除：
+
+private boolean disabled;
+
+
+不要在 TemplateDrivenMultiBranchProject 中继续保存同名状态。
+
+2. 处理 isDisabled()
+
+如果当前代码是：
+
+public boolean isDisabled() {
+    return disabled;
+}
+
+
+优先删除整个方法，让它继承父类实现。
+
+如果其他源码明确依赖该方法，且父类方法允许覆盖，则改成：
+
+@Override
+public boolean isDisabled() {
+    return super.isDisabled();
+}
+
+
+但实际上这个方法通常没有必要保留，直接继承更干净。
+
+3. 处理 setDisabled()
+
+如果当前代码是：
+
+public void setDisabled(boolean disabled) throws IOException {
+    this.disabled = disabled;
+    save();
+}
+
+
+优先删除，让父类实现接管。
+
+如果插件内部需要保留该方法，则委托给父类：
+
+@Override
+public void setDisabled(boolean disabled) throws IOException {
+    super.setDisabled(disabled);
+}
+
+
+具体方法签名以当前父类为准。编译时如果出现：
+
+method does not override or implement a method from a supertype
+
+
+说明签名不一致，不要硬加 @Override，直接删除子类方法并继承父类方法。
+
+4. 修改直接访问字段的地方
+
+如果有：
+
+if (disabled) {
+
+
+改成：
+
+if (isDisabled()) {
+
+
+如果有：
+
+if (!disabled) {
+
+
+改成：
+
+if (!isDisabled()) {
+
+
+如果有：
+
+disabled = true;
+
+
+改成：
+
+setDisabled(true);
+
+
+如果有：
+
+disabled = false;
+
+
+改成：
+
+setDisabled(false);
+
+
+总原则是：
+
+插件不再保存 disabled
+所有读取和修改都使用父类 API
+
+七、版本号修改
+
+当前版本：
+
+0.7.1-internal
+
+
+这次修复后改成：
+
+0.7.2-internal
+
+
+在 pom.xml 中修改：
+
+<version>0.7.2-internal</version>
+
+
+不要继续使用 0.7.1-internal，否则安装后难以判断 Jenkins 加载的是新包还是旧包。
+
+八、编译和检查
+
+仍然使用之前成功的编译环境执行：
+
+mvn clean verify
+
+
+如果因为旧测试在新 Jenkins 基线上失败，但主代码已经成功编译，可以先确认错误性质，再决定是否临时：
+
+mvn -DskipTests clean package
+
+
+生成后检查：
+
+find target -maxdepth 1 -type f \( -name "*.hpi" -o -name "*.jpi" \) -ls
+
+
+检查 Manifest：
+
+unzip -p target/multi-branch-project-plugin.hpi META-INF/MANIFEST.MF | grep -E "Short-Name|Plugin-Version|Jenkins-Version"
+
+
+预期：
+
+Short-Name: multi-branch-project-plugin
+Plugin-Version: 0.7.2-internal
+Jenkins-Version: 2.555.1
+
+九、替换次期 Jenkins 中的插件
+
+假设新插件放在宿主机：
+
+/tmp/multi-branch-project-plugin.hpi
+
+
+先备份：
+
+docker exec jenkins-server-ci sh -c 'cp "$JENKINS_HOME/plugins/multi-branch-project-plugin.jpi" "$JENKINS_HOME/plugins/multi-branch-project-plugin.jpi.bak_0.7.1-internal"'
+
+
+复制新插件：
+
+docker cp /tmp/multi-branch-project-plugin.hpi jenkins-server-ci:/var/jenkins_home/plugins/multi-branch-project-plugin.jpi
+
+
+修正权限：
+
+docker exec -u root jenkins-server-ci sh -c 'chown jenkins:jenkins "$JENKINS_HOME/plugins/multi-branch-project-plugin.jpi" && chmod 644 "$JENKINS_HOME/plugins/multi-branch-project-plugin.jpi"'
+
+
+删除旧解压缓存：
+
+docker exec jenkins-server-ci sh -c 'rm -rf "$JENKINS_HOME/plugins/multi-branch-project-plugin"'
+
+
+重启：
+
+docker restart jenkins-server-ci
+
+
+确认版本：
+
+docker exec jenkins-server-ci sh -c 'unzip -p "$JENKINS_HOME/plugins/multi-branch-project-plugin.jpi" META-INF/MANIFEST.MF | grep -E "Short-Name|Plugin-Version|Jenkins-Version"'
+
+
+必须显示：
+
+Plugin-Version: 0.7.2-internal
+
+十、插件修复后，还要清理旧配置
+
+仅替换插件不够，因为当前 Template_BuildCheck/config.xml 已经保存了旧的重复节点。
+
+1. 停止 Jenkins
+
+为了避免 Jenkins 退出或保存 Job 时覆盖手工改动，先停止容器：
+
+docker stop jenkins-server-ci
+
+2. 宿主机备份配置
+
+如果 Jenkins Home 映射在宿主机 /datadrive/jenkins/ci/jenkins_home，执行：
+
+cp /datadrive/jenkins/ci/jenkins_home/jobs/Template_BuildCheck/config.xml /datadrive/jenkins/ci/jenkins_home/jobs/Template_BuildCheck/config.xml.bak_before_0.7.2
+
+3. 清理重复节点
+
+删除旧插件自己的节点：
+
+<disabled defined-in="com.github.mjdetullio.jenkins.plugins.multibranch.TemplateDrivenMultiBranchProject">true</disabled>
+
+
+保留父类节点，并将模板设置为禁用：
+
+<disabled>true</disabled>
+
+
+处理后，整个根配置中只能存在一个 <disabled>：
+
+<freestyle-multi-branch-project>
+  ...
+  <disabled>true</disabled>
+  ...
+</freestyle-multi-branch-project>
+
+
+注意不要动：
+
+Template_BuildCheck/template/config.xml
+
+
+里面的分支子 Job：
+
+<disabled>true</disabled>
+
+
+是另一份文件，属于正常配置。
+
+4. 启动 Jenkins
+docker start jenkins-server-ci
+
+十一、验证插件是否彻底修好
+
+等待 Jenkins 启动完成，然后执行：
+
+docker exec jenkins-server-ci sh -c 'grep -n "<disabled" "$JENKINS_HOME/jobs/Template_BuildCheck/config.xml"'
+
+
+正确结果只能有一行：
+
+<disabled>true</disabled>
+
+
+不应再出现：
+
+defined-in="com.github.mjdetullio.jenkins.plugins.multibranch.TemplateDrivenMultiBranchProject"
+
+
+再打开：
+
+Template_BuildCheck → Configure
+
+
+保存一次，然后重新执行同一条检查命令。
+
+保存后仍然只有一个 <disabled>，才说明源码修复真正生效。
+
+十二、重新测试 Job Copy
+
+Util_CopyBuildCheckJob 中原来的：
+
+Enable Job
+
+
+继续保留，不需要改成 Replace String。
+
+删除失败残留的测试 Job后，重新执行：
+
+GITLAB_GROUP_NAME=dwh2
+TARGET_REPO_NAME=DWH_BATCH
+SYSTEM_TOOL_BRANCH=develop
+MAIL_ADDR=-@-
+
+
+预期日志：
+
+Copying Template_BuildCheck to 30_BuildCheck_dwh2_DWH_BATCH
+Fetching configuration of Template_BuildCheck...
+Enabling Job.../freestyle-multi-branch-project/disabled: true -> false
+Replacing: ...
+Creating 30_BuildCheck_dwh2_DWH_BATCH
+Copying Additional Files...
+Finished: SUCCESS
+
+最终方案总结
+根因
+新版父类 disabled
++
+旧插件 TemplateDrivenMultiBranchProject.disabled
+=
+config.xml 中出现两个 disabled 节点
+
+
+Jobcopy Builder无法唯一定位启用状态，所以：
+
+Failed to fetch disabled node
+
+正式修改
+删除 TemplateDrivenMultiBranchProject 自己的 disabled 字段
+删除或委托子类 isDisabled/setDisabled
+统一使用父类 disabled 状态
+插件版本升级为 0.7.2-internal
+清理 Template_BuildCheck 中旧的 defined-in 节点
+
+修复后的正确 XML
+
+Template：
+
+<disabled>true</disabled>
+
+
+复制出的目标 Job：
+
+<disabled>false</disabled>
+
+
+这是兼容现有 Util_CopyBuildCheckJob 的最干净方案，也不需要修改 Jobcopy Builder。
